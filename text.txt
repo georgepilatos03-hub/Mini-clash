@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Mini Royale — simple Clash-like duel</title>
+<style>
+  :root{
+    --bg:#e7f0fb;
+    --arena:#bfe1ff;
+    --card:#ffffff;
+    --friendly:#4CAF50;
+    --enemy:#E53935;
+    --tower:#8d6e63;
+    --ui:#222;
+  }
+  html,body{height:100%;margin:0;font-family:Inter,system-ui,Arial;}
+  body{display:flex;align-items:center;justify-content:center;background:var(--bg);}
+  #game {
+    width:900px;height:520px;border-radius:12px; overflow:hidden;
+    box-shadow:0 10px 30px rgba(0,0,0,.15);
+    background: linear-gradient(#cfe9ff, #eaf6ff);
+    position:relative;
+  }
+  canvas{display:block;background:var(--arena); width:100%; height:100%;}
+  #ui {
+    position:absolute;left:0;right:0;top:0;display:flex;justify-content:space-between;padding:8px 14px;pointer-events:none;
+  }
+  .panel{background:rgba(255,255,255,.9);padding:6px;border-radius:8px;box-shadow:0 2px 6px rgba(0,0,0,.08);pointer-events:auto;}
+  #cards{display:flex;gap:8px;}
+  .card{
+    width:92px;height:60px;border-radius:8px;background:var(--card);display:flex;flex-direction:column;align-items:center;justify-content:center;
+    font-size:13px;color:#111;cursor:pointer;user-select:none;border:2px solid rgba(0,0,0,.06);
+  }
+  .card.cool{opacity:.45;cursor:not-allowed;}
+  .meter{height:6px;background:rgba(0,0,0,.06);border-radius:4px;overflow:hidden;margin-top:6px;width:80%;}
+  .meter > i{display:block;height:100%;background:linear-gradient(90deg,#ffd54f,#ffc107);width:0%}
+  #status{font-size:13px;color:var(--ui)}
+  #bottomUI {position:absolute;left:0;right:0;bottom:6px;display:flex;justify-content:center;gap:12px;pointer-events:none;}
+  #controls{pointer-events:auto;display:flex;gap:8px;}
+  button{padding:8px 10px;border-radius:8px;border:0;background:#1976d2;color:white;cursor:pointer}
+  .small{font-size:12px;padding:6px 8px}
+  #log{position:absolute;left:10px;bottom:70px;background:rgba(0,0,0,.6);color:white;padding:6px 8px;border-radius:6px;font-size:12px;max-width:360px;opacity:.9}
+</style>
+</head>
+<body>
+  <div id="game">
+    <canvas id="c" width=900 height=520></canvas>
+
+    <div id="ui">
+      <div class="panel" id="leftPanel">
+        <div id="status">Mini Royale — Your towers: <span id="pT">1000</span>  |  Enemy towers: <span id="eT">1000</span></div>
+      </div>
+
+      <div class="panel" id="rightPanel">
+        <div id="turnInfo">Time: <span id="time">0</span>s</div>
+      </div>
+    </div>
+
+    <div id="bottomUI">
+      <div class="panel" id="controls" style="pointer-events:auto">
+        <div id="cards"></div>
+        <div style="display:flex;align-items:center;padding-left:6px;">
+          <button id="restart" class="small">Restart</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="log"></div>
+  </div>
+
+<script>
+/*
+ Mini Royale
+ - Two lanes (left/right) separated by river (center horizontal)
+ - Each player has two towers plus a king tower in the back center.
+ - Player spawns units by clicking a card then clicking a position in their half.
+ - Simple AI spawns units on cooldown and targets nearest enemy structure/units.
+ - Units move straight, attack when in range.
+ - Simple hitboxes, no complex pathfinding.
+*/
+
+// ---- Game constants ----
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+
+const LANE_Y = { top: 110, bottom: 410 };
+const RIVER_Y1 = 190, RIVER_Y2 = 330;
+const TOWER_HP_INIT = 1000;
+
+const UNIT_TYPES = [
+  { id:'spear', name:'Spear Soldier', hp:120, atk:30, range:18, spd:1.2, cost:2, color:'#4CAF50', size:12 },
+  { id:'knight', name:'Knight',  hp:260, atk:60, range:20, spd:0.85, cost:3, color:'#1565C0', size:16 },
+  { id:'archer', name:'Archer',  hp:80, atk:25, range:90, spd:1.1, cost:2, color:'#8E24AA', size:10}
+];
+
+let game = null;
+
+// ---- Utility ----
+function rand(a,b){return a + Math.random()*(b-a);}
+function dist(a,b){return Math.hypot(a.x-b.x,a.y-b.y);}
+
+// ---- Classes ----
+class Unit {
+  constructor(type, x,y, team){
+    Object.assign(this, JSON.parse(JSON.stringify(type))); // copy stats
+    this.x=x; this.y=y; this.team=team; this.t = 0; this.target=null; this.dead=false;
+    this.attackCooldown=0;
+  }
+  update(dt, state){
+    if(this.dead) return;
+    this.t += dt;
+    if(this.attackCooldown>0) this.attackCooldown -= dt;
+
+    // If target dead or null -> find nearest enemy (units -> towers)
+    if(!this.target || this.target.dead){
+      this.target = findNearestEnemy(this, state);
+    }
+    if(this.target){
+      const d = Math.hypot(this.target.x - this.x, this.target.y - this.y);
+      if(d <= this.range + (this.target.size||20)){
+        // in range -> attack
+        if(this.attackCooldown <= 0){
+          this.target.hp -= this.atk;
+          this.attackCooldown = 0.9; // simple cooldown
+          if(this.target.hp <= 0){
+            this.target.dead = true;
+            log((this.team===1?'You':'Enemy') + ' destroyed a ' + (this.target.isTower? 'tower' : 'unit'));
+          }
+        }
+      } else {
+        // move towards
+        const dx = (this.target.x - this.x)/d;
+        const dy = (this.target.y - this.y)/d;
+        this.x += dx * this.spd * dt * 60;
+        this.y += dy * this.spd * dt * 60;
+      }
+    } else {
+      // no target -> advance toward enemy side
+      const dir = (this.team===1)? 1 : -1;
+      this.x += dir * this.spd * dt * 60;
+    }
+  }
+  draw(ctx){
+    ctx.beginPath();
+    ctx.fillStyle = this.color;
+    ctx.arc(this.x, this.y, this.size, 0, Math.PI*2);
+    ctx.fill();
+    // HP bar
+    ctx.fillStyle='rgba(0,0,0,.15)';
+    ctx.fillRect(this.x - this.size, this.y - this.size - 8, this.size*2, 4);
+    ctx.fillStyle = 'lime';
+    const w = Math.max(0, (this.hp / (this.maxHP||this.hp)) * this.size*2);
+    ctx.fillRect(this.x - this.size, this.y - this.size - 8, w, 4);
+  }
+}
+
+class Tower {
+  constructor(x,y, team, isKing=false){
+    this.x=x; this.y=y; this.team=team; this.hp=TOWER_HP_INIT; this.isTower=true; this.isKing=isKing; this.dead=false; this.size = isKing?28:20;
+  }
+  draw(ctx){
+    ctx.fillStyle = '#8d6e63';
+    ctx.fillRect(this.x - this.size, this.y - this.size, this.size*2, this.size*2);
+    ctx.fillStyle='white';
+    ctx.fillRect(this.x - this.size + 6, this.y - 6, this.size*2 - 12, 6);
+    // hp
+    ctx.fillStyle='rgba(0,0,0,.15)';
+    ctx.fillRect(this.x - this.size, this.y + this.size + 6, this.size*2, 6);
+    ctx.fillStyle = (this.team===1)?'#66bb6a':'#ef5350';
+    const w = Math.max(0, (this.hp / TOWER_HP_INIT) * this.size*2);
+    ctx.fillRect(this.x - this.size, this.y + this.size + 6, w, 6);
+  }
+}
+
+// ---- Game logic helpers ----
+function findNearestEnemy(unit, state){
+  const enemies = state.units.filter(u=>u.team !== unit.team && !u.dead);
+  // include towers as potential targets
+  const towerTargets = state.towers.filter(t=>t.team !== unit.team && !t.dead);
+  let best = null; let bestd = Infinity;
+  enemies.concat(towerTargets).forEach(e=>{
+    const d = Math.hypot(e.x-unit.x, e.y-unit.y);
+    if(d < bestd){ best = e; bestd = d; }
+  });
+  return best;
+}
+
+function createInitialState(){
+  const s = {
+    units: [],
+    towers: [],
+    time: 0,
+    playerElixir: 4,
+    playerMax:10,
+    playerElixirRegen: 1, // per second
+    enemyElixir: 4,
+    enemyCooldown: 0,
+    cards: [ UNIT_TYPES[0], UNIT_TYPES[1], UNIT_TYPES[2] ],
+    selectedCard: null,
+    log: []
+  };
+  // Player towers (team=1)
+  s.towers.push(new Tower(110, 120, 1)); // left front
+  s.towers.push(new Tower(770, 120, 1)); // right front
+  s.towers.push(new Tower(440, 60, 1, true)); // king (back center)
+
+  // Enemy towers (team=2)
+  s.towers.push(new Tower(110, 400, 2)); // left enemy front
+  s.towers.push(new Tower(770, 400, 2)); // right enemy front
+  s.towers.push(new Tower(440, 460, 2, true)); // enemy king
+
+  return s;
+}
+
+// ---- UI wiring ----
+const cardsDiv = document.getElementById('cards');
+const pT = document.getElementById('pT'), eT = document.getElementById('eT'), timeEl = document.getElementById('time');
+const logDiv = document.getElementById('log');
+
+function log(msg){
+  game.log.push(msg);
+  if(game.log.length>6) game.log.shift();
+  logDiv.innerHTML = game.log.slice().reverse().map(s=>'<div>• '+escapeHtml(s)+'</div>').join('');
+}
+function escapeHtml(s){return s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');}
+
+function buildCards(){
+  cardsDiv.innerHTML='';
+  game.cards.forEach((c,idx)=>{
+    const el = document.createElement('div');
+    el.className='card';
+    el.innerHTML = `<div style="font-weight:600">${c.name}</div><div style="font-size:12px">Cost: ${c.cost}</div><div class="meter"><i style="width:0%"></i></div>`;
+    el.onclick = ()=>{
+      if(game.playerElixir < c.cost) return;
+      if(game.selectedCard === c) game.selectedCard = null; else game.selectedCard = c;
+      updateCardUI();
+    };
+    cardsDiv.appendChild(el);
+  });
+  updateCardUI();
+}
+
+function updateCardUI(){
+  Array.from(cardsDiv.children).forEach((el, idx)=>{
+    const c = game.cards[idx];
+    el.classList.toggle('cool', game.playerElixir < c.cost);
+    el.style.outline = (game.selectedCard===c)? '3px solid rgba(255,215,0,.35)':'none';
+    const meter = el.querySelector('.meter i');
+    const pct = Math.min(100, (game.playerElixir / game.playerMax) * 100);
+    meter.style.width = pct + '%';
+  });
+}
+
+// Spawn unit (player)
+canvas.addEventListener('click', (ev)=>{
+  if(!game) return;
+  const rect = canvas.getBoundingClientRect();
+  const x = (ev.clientX - rect.left) * (canvas.width/rect.width);
+  const y = (ev.clientY - rect.top) * (canvas.height/rect.height);
+
+  if(!game.selectedCard) return;
+  // only allow spawning on player's half (top half)
+  if(y > H/2 - 10) {
+    log('Place units on your side (top half).');
+    return;
+  }
+  // lane constraint: either left or right lane region
+  // we allow full top half but units can't be spawned inside river
+  if(y > RIVER_Y1 && y < RIVER_Y2){
+    log('Cannot place units in the river.');
+    return;
+  }
+  const type = game.selectedCard;
+  if(game.playerElixir < type.cost) { log('Not enough elixir'); return; }
+  game.playerElixir -= type.cost;
+  const u = new Unit(type, x, y, 1);
+  u.maxHP = u.hp;
+  game.units.push(u);
+  game.selectedCard = null;
+  updateCardUI();
+});
+
+// restart button
+document.getElementById('restart').addEventListener('click', ()=>{ reset(); });
+
+// ---- AI ----
+function enemy
